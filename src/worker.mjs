@@ -1,62 +1,70 @@
 import { Buffer } from "node:buffer";
 
+// ===== 幫助圖片轉換的輔助方法 =====
+const parseImg = async (url) => {
+  let mimeType, data;
+  if (url.startsWith("http://") || url.startsWith("https://")) {
+    // 線上圖片自動下載並 base64
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to download image: ${url} - ${response.statusText}`);
+    }
+    mimeType = response.headers.get("content-type") || "image/jpeg";
+    data = Buffer.from(await response.arrayBuffer()).toString("base64");
+  } else {
+    // data url or base64
+    const match = url.match(/^data:(?<mimeType>.*?)(;base64)?,(?<data>.*)$/);
+    if (!match) throw new Error("Invalid image data: " + url);
+    ({ mimeType, data } = match.groups);
+  }
+  return { inlineData: { mimeType, data } };
+};
+
+// ====== 主 export ======
 export default {
   async fetch(request) {
-    if (request.method === "OPTIONS") {
-      return handleOPTIONS();
-    }
-    const errHandler = (err) => {
-      console.error(err);
-      return jsonResponse({ error: err.message }, fixCors({ status: err.status ?? 500 }));
-    };
+    if (request.method === "OPTIONS") return handleOPTIONS();
+
     try {
       const auth = request.headers.get("Authorization");
       const apiKey = auth?.split(" ")[1];
-      const assert = (success) => {
-        if (!success) {
-          throw new HttpError("The specified HTTP method is not allowed for the requested resource", 400);
-        }
-      };
       const { pathname } = new URL(request.url);
+
       switch (true) {
         case pathname.endsWith("/chat/completions"):
-          assert(request.method === "POST");
-          return handleCompletions(await request.json(), apiKey)
-            .catch(errHandler);
+          if (request.method !== "POST") return notAllowed();
+          return await handleCompletions(await request.json(), apiKey);
         case pathname.endsWith("/embeddings"):
-          assert(request.method === "POST");
-          return handleEmbeddings(await request.json(), apiKey)
-            .catch(errHandler);
+          if (request.method !== "POST") return notAllowed();
+          return await handleEmbeddings(await request.json(), apiKey);
         case pathname.endsWith("/models"):
-          assert(request.method === "GET");
-          return handleModels(apiKey)
-            .catch(errHandler);
+          if (request.method !== "GET") return notAllowed();
+          return await handleModels(apiKey);
         default:
-          throw new HttpError("404 Not Found", 404);
+          return notFound();
       }
     } catch (err) {
-      return errHandler(err);
+      console.error("[WORKER ERROR]", err);
+      return jsonResponse({ error: err.message || String(err) }, fixCors({ status: 500 }));
     }
   }
 };
 
-class HttpError extends Error {
-  constructor(message, status) {
-    super(message);
-    this.name = this.constructor.name;
-    this.status = status;
-  }
-}
+// ============= 各種 handler 實作 =============
 
-// 統一的 CORS 與 Content-Encoding
-const fixCors = ({ headers, status, statusText }) => {
+const BASE_URL = "https://generativelanguage.googleapis.com";
+const API_VERSION = "v1beta";
+const API_CLIENT = "genai-js/0.21.0";
+const DEFAULT_MODEL = "gemini-2.5-flash";
+const DEFAULT_EMBEDDINGS_MODEL = "text-embedding-004";
+
+// 統一 header/cors
+function fixCors({ headers, status, statusText }) {
   headers = new Headers(headers);
   headers.set("Access-Control-Allow-Origin", "*");
   headers.set("Content-Encoding", "identity");
   return { headers, status, statusText };
-};
-
-// 統一 JSON 回應
+}
 function jsonResponse(body, base = {}) {
   return new Response(
     typeof body === "string" ? body : JSON.stringify(body),
@@ -70,29 +78,23 @@ function jsonResponse(body, base = {}) {
     }
   );
 }
+const handleOPTIONS = async () => new Response(null, {
+  headers: {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "*",
+    "Access-Control-Allow-Headers": "*",
+    "Content-Encoding": "identity"
+  }
+});
+const notFound = () => jsonResponse({ error: "404 Not Found" }, fixCors({ status: 404 }));
+const notAllowed = () => jsonResponse({ error: "405 Method Not Allowed" }, fixCors({ status: 405 }));
 
-// CORS OPTIONS
-const handleOPTIONS = async () => {
-  return new Response(null, {
-    headers: {
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "*",
-      "Access-Control-Allow-Headers": "*",
-      "Content-Encoding": "identity"
-    }
-  });
-};
-
-const BASE_URL = "https://generativelanguage.googleapis.com";
-const API_VERSION = "v1beta";
-const API_CLIENT = "genai-js/0.21.0";
 const makeHeaders = (apiKey, more) => ({
   "x-goog-api-client": API_CLIENT,
   ...(apiKey && { "x-goog-api-key": apiKey }),
   ...more
 });
 
-// ===== models
 async function handleModels(apiKey) {
   const response = await fetch(`${BASE_URL}/${API_VERSION}/models`, {
     headers: makeHeaders(apiKey),
@@ -113,24 +115,10 @@ async function handleModels(apiKey) {
   return jsonResponse(body, fixCors(response));
 }
 
-// ===== embeddings
-const DEFAULT_EMBEDDINGS_MODEL = "text-embedding-004";
 async function handleEmbeddings(req, apiKey) {
-  if (typeof req.model !== "string") {
-    throw new HttpError("model is not specified", 400);
-  }
-  let model;
-  if (req.model.startsWith("models/")) {
-    model = req.model;
-  } else {
-    if (!req.model.startsWith("gemini-")) {
-      req.model = DEFAULT_EMBEDDINGS_MODEL;
-    }
-    model = "models/" + req.model;
-  }
-  if (!Array.isArray(req.input)) {
-    req.input = [req.input];
-  }
+  if (typeof req.model !== "string") throw new Error("model is not specified");
+  let model = req.model.startsWith("models/") ? req.model : "models/" + (req.model.startsWith("gemini-") ? req.model : DEFAULT_EMBEDDINGS_MODEL);
+  if (!Array.isArray(req.input)) req.input = [req.input];
   const response = await fetch(`${BASE_URL}/${API_VERSION}/${model}:batchEmbedContents`, {
     method: "POST",
     headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
@@ -158,38 +146,22 @@ async function handleEmbeddings(req, apiKey) {
   return jsonResponse(body, fixCors(response));
 }
 
-// ===== chat completions
-const DEFAULT_MODEL = "gemini-2.5-flash";
 async function handleCompletions(req, apiKey) {
   let model = DEFAULT_MODEL;
-  switch (true) {
-    case typeof req.model !== "string":
-      break;
-    case req.model.startsWith("models/"):
-      model = req.model.substring(7);
-      break;
-    case req.model.startsWith("gemini-"):
-    case req.model.startsWith("gemma-"):
-    case req.model.startsWith("learnlm-"):
-      model = req.model;
+  if (typeof req.model === "string") {
+    if (req.model.startsWith("models/")) model = req.model.substring(7);
+    else model = req.model;
   }
   let body = await transformRequest(req);
-  const extra = req.extra_body?.google;
-  if (extra) {
-    if (extra.safety_settings) body.safetySettings = extra.safety_settings;
-    if (extra.cached_content) body.cachedContent = extra.cached_content;
-    if (extra.thinking_config) body.generationConfig.thinkingConfig = extra.thinking_config;
-  }
-  switch (true) {
-    case model.endsWith(":search"):
-      model = model.substring(0, model.length - 7);
-    case req.model.endsWith("-search-preview"):
-      body.tools = body.tools || [];
-      body.tools.push({ googleSearch: {} });
+  // 支援 Google Search 工具
+  if (model.endsWith(":search")) {
+    model = model.substring(0, model.length - 7);
+    body.tools = body.tools || [];
+    body.tools.push({ googleSearch: {} });
   }
   const TASK = req.stream ? "streamGenerateContent" : "generateContent";
   let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
-  if (req.stream) { url += "?alt=sse"; }
+  if (req.stream) url += "?alt=sse";
   const response = await fetch(url, {
     method: "POST",
     headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
@@ -199,7 +171,7 @@ async function handleCompletions(req, apiKey) {
   if (response.ok) {
     let id = "chatcmpl-" + generateId();
     if (req.stream) {
-      // 流式 SSE 自己加 header
+      // 流式 SSE
       let sseHeaders = fixCors(response);
       sseHeaders.headers.set("Content-Type", "text/event-stream");
       return new Response(response.body, sseHeaders);
@@ -217,46 +189,38 @@ async function handleCompletions(req, apiKey) {
     }
   } else {
     let errorText = await response.text();
+    console.error("[Gemini API ERROR]", errorText);
     return jsonResponse(errorText, fixCors(response));
   }
 }
 
-// --------------- 下面維持原本各種轉換 function（原樣即可） ----------------
-// generateId, transformRequest, processCompletionsResponse, 等等
-// 如果你有現成內容就直接複製，如果要完整內容請告訴我！
-
-// ------------------------------------------------------
-
-function generateId() {
-  const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  const randomChar = () => characters[Math.floor(Math.random() * characters.length)];
-  return Array.from({ length: 29 }, randomChar).join("");
-}
-
-// ...以下原本轉換 function 可保留...
-
-// ------------------------------------------------------
-
-// 產生唯一ID（已經有在上面）
-
-// Gemini/OAI API 轉換與回應格式化
+// ===== 轉換 messages 支援 vision =====
 async function transformRequest(req) {
-  // 你可以直接複製之前版本的 transformRequest，或從 https://github.com/PublicAffairs/openai-gemini 取出
-  // 示範版（請依你需求調整）：
+  // messages: [{role, content: [{type: "text"|"image_url", text|image_url:{url}}]}]
+  const parts = [];
+  for (const msg of req.messages || []) {
+    if (msg.content && Array.isArray(msg.content)) {
+      for (const item of msg.content) {
+        if (item.type === "image_url" && item.image_url?.url) {
+          parts.push(await parseImg(item.image_url.url));
+        } else if (item.type === "text" && item.text) {
+          parts.push({ text: item.text });
+        }
+      }
+    } else if (typeof msg.content === "string") {
+      parts.push({ text: msg.content });
+    }
+  }
+  if (parts.length === 0) parts.push({ text: "" }); // 至少有一個 text
   return {
-    contents: [{
-      role: "user",
-      parts: [{ text: req.messages?.map(m => m.content).join("\n") }]
-    }],
+    contents: [{ role: "user", parts }],
     generationConfig: {
       maxOutputTokens: req.max_tokens || 2048,
       temperature: req.temperature || 0.9
-    },
-    // ...其他需要的欄位
+    }
   };
 }
 
-// 處理 Gemini Completion 回應，轉換成 OAI 格式
 function processCompletionsResponse(data, model, id) {
   return JSON.stringify({
     id,
@@ -274,4 +238,10 @@ function processCompletionsResponse(data, model, id) {
       total_tokens: data.usageMetadata.totalTokenCount
     } : undefined
   });
+}
+
+function generateId() {
+  const characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const randomChar = () => characters[Math.floor(Math.random() * characters.length)];
+  return Array.from({ length: 29 }, randomChar).join("");
 }
